@@ -25,9 +25,11 @@ from app.pipeline.image_utils import fit_images_to_budget, image_to_bytes
 from app.pipeline.preprocess import preprocess_images
 from app.services.cost import compute_cost
 from app.services.field_merger import _clean_list, to_asset_details
-from app.services.fx import get_usd_to_inr
+from app.markets.registry import resolve_market
+from app.services.fx import get_fx_rate, get_usd_to_inr
 from app.services.gemini import GeminiService
 from app.services.condition_mapper import (
+    resolve_condition_grade,
     build_damage_items,
     damage_needs_review,
     stickers_need_review,
@@ -48,6 +50,7 @@ from app.services.placement_mapper import (
 from app.services.reasoning_summary import build_reasoning_summary
 from app.services.repair_policy import build_repair_plan
 from app.services.valuation_display import client_valuation
+from app.services.history_repository import get_history_repository
 from app.services.valuation_engine import compute_valuation
 
 logger = structlog.get_logger()
@@ -65,8 +68,12 @@ class AssetAnalysisService:
         files: list[UploadTuple],
         method: UnifiedViewMethod,
         locale: str | None = None,
+        market_region: str | None = None,
+        processing_mode: str | None = None,
+        api_route: str | None = None,
     ) -> AnalyzeResponse:
-        locale = locale or self.settings.default_locale
+        market = resolve_market(market_region, self.settings)
+        locale = locale or market.default_locale
         request_id = str(uuid.uuid4())
         start = time.perf_counter()
         stage_timings: dict[str, int] = {}
@@ -98,6 +105,7 @@ class AssetAnalysisService:
             locale=locale,
             image_labels=image_labels if method == UnifiedViewMethod.MULTI_IMAGE else None,
             total_images=len(processed),
+            market_region=market.region,
         )
         stage_timings["gemini_ms"] = int((time.perf_counter() - t1) * 1000)
 
@@ -106,7 +114,7 @@ class AssetAnalysisService:
 
         identity_result = validate_identity(
             llm,
-            min_confidence=self.settings.valuation_confidence_threshold,
+            min_confidence=self.settings.field_confidence_threshold,
         )
         if not identity_result.passed or identity_result.withheld_identity:
             IDENTITY_LOW_CONFIDENCE.inc()
@@ -119,12 +127,13 @@ class AssetAnalysisService:
         )
         confidence = self._build_confidence(llm)
 
-        fx = await get_usd_to_inr(self.settings)
+        fx = await get_fx_rate(self.settings, market.fx_target)  # type: ignore[arg-type]
         valuation = compute_valuation(
             llm,
             condition,
             identity_result,
-            usd_to_inr=fx.rate,
+            usd_to_display=fx.rate,
+            market=market,
             valuation_confidence_min=self.settings.valuation_confidence_threshold,
             asset=asset,
             settings=self.settings,
@@ -132,24 +141,23 @@ class AssetAnalysisService:
         valuation = apply_nbv_proxy(
             valuation,
             llm,
-            usd_to_inr=fx.rate,
+            usd_to_display=fx.rate,
+            market=market,
             asset=asset,
             settings=self.settings,
         )
-        valuation = apply_nbv_comparison(valuation)
+        valuation = apply_nbv_comparison(valuation, market)
 
         if valuation.status in (ValuationStatus.WITHHELD, ValuationStatus.INDICATIVE_ONLY):
             VALUATION_WITHHELD.labels(status=valuation.status.value).inc()
 
         reasoning_summary = build_reasoning_summary(llm)
-        cost = compute_cost(usage, fx, self.settings)
+        cost_fx = await get_usd_to_inr(self.settings)
+        cost = compute_cost(usage, cost_fx, self.settings)
 
         review_required = (
             identity_result.withheld_identity
-            or identity_result.generation_ambiguous
             or confidence.overall < self.settings.review_confidence_threshold
-            or valuation.status == ValuationStatus.WITHHELD
-            or (valuation.status == ValuationStatus.INDICATIVE_ONLY and valuation.confidence < self.settings.valuation_confidence_threshold)
             or identifiers_need_review(llm, asset.asset_tag_number, len(processed))
             or stickers_need_review(llm)
             or stickers_image_index_need_review(llm.stickers, len(processed))
@@ -182,12 +190,12 @@ class AssetAnalysisService:
             analysis_policy=AnalysisPolicy(
                 valuation_confidence_threshold=self.settings.valuation_confidence_threshold,
                 review_confidence_threshold=self.settings.review_confidence_threshold,
-                reference_prices_source=reference_data_label(self.settings),
+                reference_prices_source=reference_data_label(self.settings, market.region),
                 fx_enabled=self.settings.fx_enabled,
                 fx_source=fx.source,
                 fx_is_fallback=fx.is_fallback,
-                display_currency=self.settings.display_currency,
-                market_region=self.settings.market_region,
+                display_currency=market.currency,
+                market_region=market.region,
             ),
             reasoning_summary=reasoning_summary,
             stage_timings_ms=stage_timings,
@@ -199,6 +207,21 @@ class AssetAnalysisService:
             token_usage=usage,
             cost=cost,
         )
+
+        entry_id, saved_to_db, image_urls = await get_history_repository(
+            self.settings
+        ).save_analysis(
+            user_id=self.settings.demo_user_id,
+            request_id=request_id,
+            response=response,
+            processed_images=processed,
+            method=method,
+            processing_mode=processing_mode,
+            api_route=api_route,
+        )
+        response.entry_id = entry_id
+        response.saved_to_db = saved_to_db
+        response.image_urls = image_urls
 
         logger.info(
             "analysis_complete",
@@ -215,6 +238,7 @@ class AssetAnalysisService:
             total_cost_usd=cost.total_cost_usd,
             elapsed_ms=elapsed_ms,
             stage_timings=stage_timings,
+            saved_to_db=saved_to_db,
         )
         return response
 
@@ -243,7 +267,7 @@ class AssetAnalysisService:
                 score = None
 
         return ConditionReport(
-            grade=llm.condition_grade,
+            grade=resolve_condition_grade(llm.condition_grade, score or llm.condition_score),
             overall_score=score,
             summary=llm.condition_summary,
             cosmetic_condition=llm.cosmetic_condition,

@@ -6,6 +6,7 @@ import structlog
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 
 from app.config import Settings, get_settings
+from app.markets.registry import resolve_market
 from app.models.responses import AnalyzeResponse, HealthResponse, UnifiedViewMethod
 from app.services.analyzer import AssetAnalysisService
 from app.services.gemini import GeminiService
@@ -45,17 +46,21 @@ async def _run_analysis(
     images: list[UploadFile],
     method: UnifiedViewMethod,
     locale: str,
+    market_region: str,
     settings: Settings,
     rate_limiter: RateLimiter,
     analyzer: AssetAnalysisService,
+    processing_mode: str | None = None,
+    api_route: str | None = None,
 ) -> AnalyzeResponse:
     rate_limiter.check("poc")
     real_count = len([img for img in (images or []) if img is not None and (img.filename or img.content_type)])
-    if real_count > settings.max_images:
+    limit = settings.upload_image_limit
+    if real_count > limit:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                f"At most {settings.max_images} images allowed "
+                f"At most {limit} images allowed "
                 f"(got {real_count}). Use fewer angles or split into multiple requests."
             ),
         )
@@ -63,7 +68,14 @@ async def _run_analysis(
 
     with timer() as elapsed:
         try:
-            result = await analyzer.analyze(files=files, method=method, locale=locale)
+            result = await analyzer.analyze(
+                files=files,
+                method=method,
+                locale=locale,
+                market_region=market_region,
+                processing_mode=processing_mode,
+                api_route=api_route,
+            )
         except ValueError as exc:
             REQUEST_COUNT.labels(status="400").inc()
             raise HTTPException(
@@ -97,13 +109,28 @@ async def _run_analysis(
 )
 async def analyze_collage(
     images: Annotated[list[UploadFile], File(description="1-10 asset photos")],
-    locale: Annotated[str, Form(description="Output language")] = "en-IN",
+    locale: Annotated[str | None, Form(description="Output language")] = None,
+    market_region: Annotated[
+        str | None, Form(description="Market region: IN | US | GB (omit for MARKET_REGION env)")
+    ] = None,
+    processing_mode: Annotated[
+        str | None, Form(description="Frontend processing mode: collage | direct")
+    ] = None,
     settings: Settings = Depends(get_settings),
     rate_limiter: RateLimiter = Depends(get_rate_limiter),
     analyzer: AssetAnalysisService = Depends(get_analyzer),
 ) -> AnalyzeResponse:
+    market = resolve_market(market_region, settings)
     return await _run_analysis(
-        images, UnifiedViewMethod.COLLAGE, locale, settings, rate_limiter, analyzer
+        images,
+        UnifiedViewMethod.COLLAGE,
+        locale or market.default_locale,
+        market.region,
+        settings,
+        rate_limiter,
+        analyzer,
+        processing_mode=processing_mode or "collage",
+        api_route="/v1/assets/analyze/collage",
     )
 
 
@@ -121,11 +148,26 @@ async def analyze_collage(
 )
 async def analyze_multi(
     images: Annotated[list[UploadFile], File(description="1-10 asset photos")],
-    locale: Annotated[str, Form(description="Output language")] = "en-IN",
+    locale: Annotated[str | None, Form(description="Output language")] = None,
+    market_region: Annotated[
+        str | None, Form(description="Market region: IN | US | GB (omit for MARKET_REGION env)")
+    ] = None,
+    processing_mode: Annotated[
+        str | None, Form(description="Frontend processing mode: collage | direct")
+    ] = None,
     settings: Settings = Depends(get_settings),
     rate_limiter: RateLimiter = Depends(get_rate_limiter),
     analyzer: AssetAnalysisService = Depends(get_analyzer),
 ) -> AnalyzeResponse:
+    market = resolve_market(market_region, settings)
     return await _run_analysis(
-        images, UnifiedViewMethod.MULTI_IMAGE, locale, settings, rate_limiter, analyzer
+        images,
+        UnifiedViewMethod.MULTI_IMAGE,
+        locale or market.default_locale,
+        market.region,
+        settings,
+        rate_limiter,
+        analyzer,
+        processing_mode=processing_mode or "direct",
+        api_route="/v1/assets/analyze/multi",
     )

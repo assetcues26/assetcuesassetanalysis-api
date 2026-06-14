@@ -5,6 +5,8 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+from app.models.history import ImageUrls
+
 
 class UnifiedViewMethod(str, Enum):
     COLLAGE = "collage"
@@ -176,11 +178,15 @@ class MoneyRange(BaseModel):
 class ValuationAmount(BaseModel):
     usd: MoneyRange = Field(default_factory=MoneyRange)
     inr: MoneyRange = Field(default_factory=MoneyRange)
+    display: MoneyRange = Field(default_factory=MoneyRange)
+    display_currency: str = "INR"
 
 
 class NbvEstimate(BaseModel):
     usd: MoneyRange = Field(default_factory=MoneyRange)
     inr: MoneyRange = Field(default_factory=MoneyRange)
+    display: MoneyRange = Field(default_factory=MoneyRange)
+    display_currency: str = "INR"
     method: str = "age_derived_proxy"
     age_years_used: Optional[float] = None
     depreciation_rate_used: Optional[float] = None
@@ -331,6 +337,9 @@ class AnalysisPolicy(BaseModel):
 class AnalyzeResponse(BaseModel):
     collage_base64: Optional[str] = None
     request_id: str
+    entry_id: Optional[str] = None
+    saved_to_db: bool = False
+    image_urls: Optional[ImageUrls] = None
     status: str = "success"
     processing_time_ms: int
     analysis_method: UnifiedViewMethod
